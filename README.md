@@ -1,5 +1,7 @@
 # streamingbot
 
+**Статус**: Архитектурный дизайн-документ (DDD + Clean Architecture). Код ещё не реализован.
+
 телеграм-бот на go для безопасного предоставления доступа к стриминговому контенту. пользователь оплачивает доступ через telegram stars, получает одноразовую подписанную ссылку и оставляет отзыв. центральная задача — надёжность, идемпотентность и защита данных.
 
 ---
@@ -110,7 +112,191 @@ func (s *Scheduler) Start(ctx context.Context) {
 
 ---
 
-## ключевые решения и допущения
+## Telegram Stars: платёжный поток
+
+### Сценарий: пользователь покупает контент
+
+```
+1. Бот отправляет каталог (/catalog)
+   - Кнопки: [видео 1: 25⭐] [видео 2: 50⭐] ...
+
+2. Пользователь нажимает кнопку
+   - adapters/telegram/handler.go → StartPurchase use case
+   - Создаётся Purchase(status=pending, user_id, content_id, telegram_payload)
+   - Генерируется invoice_id (ULID)
+
+3. Твердым отправляет Telegram Invoice
+   - invoice_payload = JSON {purchase_id, user_id, content_id}
+   - Пользователь видит платёж в Telegram с ценой
+   - callback_data направляет на bot callback
+
+4. Telegram обрабатывает платёж
+   - Успех: отправляет webhook successful_payment
+   - Ошибка (cancelled, network fail): ничего; User может повторить
+
+5. Bot получает successful_payment webhook
+   - charge_id (уникальный) + invoice_payload
+   - app/confirm_telegram_payment/handler.go (выполняется идемпотентно)
+   - Purchase: pending → paid
+   - Опубликовать outbox event: PurchaseConfirmed
+
+6. Scheduler обрабатывает outbox
+   - app/issue_access_link/handler.go
+   - Создаёт AccessGrant + генерирует токен
+   - Отправляет ссылку пользователю
+
+7. Пользователь получает ссылку (one-time)
+   - Нажимает → redirect к streaming provider
+   - Первое использование → used_at проставляется
+   - Повторный клик → error (link already used)
+```
+
+### Обработка ошибок и краевых случаев
+
+**Пользователь отменил платёж**: 
+- Telegram НЕ отправляет webhook
+- Purchase остаётся в pending
+- Purchase.created_at + 24h → scheduler помечает как expired
+- Purchase можно пересоздать (новый invoice)
+
+**Сетевая ошибка при отправке invoice**:
+- Telegram не получил invoice → User не видит платёж
+- Бот может переотправить invoice с тем же invoice_id
+- Telegram возвращает дубликат (tolerate) или новый платёж
+
+**Webhook successful_payment пришёл дважды**:
+- idempotency_keys таблица → проверка charge_id
+- Второй webhook → return 200 (идемпотентно)
+- Purchase создан один раз
+
+**Streaming provider недоступен при issue_access**:
+- app/issue_access_link вернёт ошибку
+- Purchase остался в paid (outbox event не отмечен как published)
+- Scheduler переиграет через 30 сек
+- После 3 неудач: Purchase → error статус (требует support)
+
+**Refund (user просит вернуть деньги)**:
+- Telegram расцепляет платёж (в их системе)
+- Webhook refund (НЕ реализовано в MVP) → был бы handled так:
+  - Поиск Purchase по refund_id
+  - Purchase → refunded статус
+  - AccessGrant инвалидирован
+  - User не может использовать ссылку
+- **MVP**: refund обрабатывается вручную support'ом
+
+---
+
+## Streaming API Contract
+
+**Задача**: получить одноразовую ссылку на контент для пользователя.
+
+### Request: GET /api/v1/access/issue-link
+
+```json
+{
+    "external_ref": "aGVsbG8gd29ybGQh",        // base64(decrypt("content.external_ref"))
+    "user_id": "12345",                         // telegram user_id
+    "ttl_minutes": 1440,                        // 24 часа
+    "idempotency_key": "uuid-purchase-id"       // для дедупликации
+}
+```
+
+### Response 200: AccessLink Issued
+
+```json
+{
+    "link": "https://stream.example.com/watch?token=abc123xyz",
+    "expires_at": "2026-03-16T12:30:00Z",
+    "one_time": true,
+    "metadata": {
+        "content_id": "aGVsbG8gd29ybGQh",
+        "issued_by": "bot",
+        "viewer_id": "12345"
+    }
+}
+```
+
+### Response 409: Link Already Issued (Idempotent)
+
+```json
+{
+    "error": "link_already_issued",
+    "link": "https://stream.example.com/watch?token=abc123xyz",
+    "expires_at": "2026-03-16T12:30:00Z",
+    "message": "Ссылка с этим idempotency_key уже была выдана"
+}
+```
+
+### Response 401: Unauthorized
+
+```json
+{
+    "error": "invalid_credentials",
+    "message": "streaming_api_key неверный или истёк"
+}
+```
+
+### Response 503: Service Unavailable
+
+```json
+{
+    "error": "temporarily_unavailable",
+    "message": "Streaming сервис временно недоступен",
+    "retry_after_seconds": 60
+}
+```
+
+### Implementation in Code
+
+```go
+// adapters/streaming/client.go
+type StreamingClient struct {
+    httpClient *http.Client
+    baseURL    string
+    apiKey     string
+}
+
+func (c *StreamingClient) IssueAccessLink(ctx context.Context, req IssueAccessRequest) (*AccessLink, error) {
+    // 1. Timeout на весь запрос
+    ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+    defer cancel()
+    
+    // 2. Construct request with API key
+    url := c.baseURL + "/api/v1/access/issue-link"
+    body, _ := json.Marshal(req)
+    httpReq, _ := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
+    httpReq.Header.Set("Authorization", "Bearer " + c.apiKey)
+    httpReq.Header.Set("Content-Type", "application/json")
+    
+    // 3. Execute
+    resp, err := c.httpClient.Do(httpReq)
+    if err != nil {
+        return nil, ErrStreamingProviderUnavailable // retry later
+    }
+    defer resp.Body.Close()
+    
+    // 4. Handle response codes
+    switch resp.StatusCode {
+    case 200:
+        var link AccessLink
+        json.NewDecoder(resp.Body).Decode(&link)
+        return &link, nil
+    case 409:
+        // Idempotent: сссылка уже была выдана, это OK
+        var link AccessLink
+        json.NewDecoder(resp.Body).Decode(&link)
+        return &link, nil
+    case 401:
+        return nil, ErrInvalidStreamingCredentials
+    case 503:
+        return nil, ErrStreamingProviderUnavailable // retry
+    default:
+        return nil, ErrUnexpectedStreamingResponse
+    }
+}
+```
+
+---
 
 ### Business решения
 1. **Telegram Stars как единственный платёж** — мы не переводим деньги, только активируем доступ; отката платежа в архитектуре нет
@@ -244,6 +430,17 @@ streamingbot/
 
 ### domain/content — каталог и метаданные
 Отвечает за: контент, цены, активность. `external_ref` ВСЕГДА зашифрован.
+
+**Управление каталогом**: 
+- Content создаётся администраторами вручную через SQL миграции или future admin API
+- Каждый Content содержит: title, прайс в Telegram Stars, зашифрованный external_ref у стриминг-провайдера
+- Бот вывешивает доступный контент меню-командой `/catalog` (выполняется как адаптер)
+- Content.active флаг позволяет снимать продукт с продажи без удаления истории
+
+**Telegram Stars прайсинг**:
+- Фиксированная цена per Content (1 звезда = минимум, обычно 10-100 звёзд за видео)
+- Нет скидок/купонов на этом этапе (future feature)
+- Мини-версии видео бесплатно (future), full access - платный
 
 ### domain/purchase — ЦЕНТРАЛЬНАЯ сущность заказа
 Отвечает за: жизненный цикл: pending → paid → access_issued → expired | error.
@@ -794,11 +991,13 @@ sched.Start(ctx)  // остановится после context timeout или ct
 
 ---
 
-## запуск
+## запуск (future: код ещё не реализован)
+
+Когда будет реализована основная структура:
 
 ```bash
 cp .env.example .env
-# заполнить .env реальными значениями
+# заполнить .env реальными значениями (BOT_TOKEN, STREAMING_API_KEY, etc.)
 docker compose up -d
 ```
 
@@ -806,8 +1005,11 @@ docker compose up -d
 
 ```bash
 go mod download
+go mod tidy
 go run ./cmd/bot
 ```
+
+**Требования**: Go 1.22+, PostgreSQL 15+, Redis 7+
 
 ---
 
