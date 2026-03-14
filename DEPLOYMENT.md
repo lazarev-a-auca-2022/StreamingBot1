@@ -321,6 +321,7 @@ Admin-only commands:
 - `/createcontent <id> <bunny_video_id> <price> <title>|<description>`
 - `/deletecontent <id>`
 - `/setcontent <id> <price> <title>|<description>`
+- `/forcebuy <content_id>`
 
 Examples:
 
@@ -331,6 +332,8 @@ Examples:
 `/setcontent yoga-101 30 Yoga Basics Updated|New description`
 
 `/deletecontent yoga-101`
+
+`/forcebuy content-demo-1`
 
 ### 12.2 Endpoints used in the flow
 

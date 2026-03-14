@@ -6,10 +6,13 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
+	"streamingbot/internal/app/confirm_payment"
 	"streamingbot/internal/app/start_purchase"
 	"streamingbot/internal/app/submit_review"
 	"streamingbot/internal/domain/content"
+	"streamingbot/internal/domain/payment"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
@@ -18,6 +21,7 @@ type Bot struct {
 	api          *tgbotapi.BotAPI
 	catalog      content.Repository
 	start        start_purchase.Handler
+	confirm      confirm_payment.Handler
 	submitReview submit_review.Handler
 	pollTimeout  int
 	adminSecret  string
@@ -30,7 +34,7 @@ type contentAdminRepository interface {
 	DeleteByID(ctx context.Context, id string) error
 }
 
-func NewBot(token string, pollTimeout int, adminSecret string, catalog content.Repository, start start_purchase.Handler, submit submit_review.Handler) (*Bot, error) {
+func NewBot(token string, pollTimeout int, adminSecret string, catalog content.Repository, start start_purchase.Handler, confirm confirm_payment.Handler, submit submit_review.Handler) (*Bot, error) {
 	api, err := tgbotapi.NewBotAPI(token)
 	if err != nil {
 		return nil, err
@@ -42,6 +46,7 @@ func NewBot(token string, pollTimeout int, adminSecret string, catalog content.R
 		api:          api,
 		catalog:      catalog,
 		start:        start,
+		confirm:      confirm,
 		submitReview: submit,
 		pollTimeout:  pollTimeout,
 		adminSecret:  adminSecret,
@@ -205,6 +210,21 @@ func (b *Bot) handleMessage(ctx context.Context, msg *tgbotapi.Message) {
 				return
 			}
 			b.reply(chatID, "content updated")
+		case "forcebuy":
+			if !b.isAdmin(userID) {
+				b.reply(chatID, "admin required")
+				return
+			}
+			contentID := strings.TrimSpace(msg.CommandArguments())
+			if contentID == "" {
+				b.reply(chatID, "Usage: /forcebuy <content_id>")
+				return
+			}
+			if err := b.forceBuy(ctx, chatID, userID, contentID); err != nil {
+				b.reply(chatID, "forcebuy failed: "+err.Error())
+				return
+			}
+			b.reply(chatID, "forcebuy success: purchase marked paid; access link will be sent shortly")
 		case "catalog":
 			items, err := b.catalog.ListActive(ctx)
 			if err != nil {
@@ -360,4 +380,26 @@ func splitTitleDesc(raw string) (string, string) {
 		desc = strings.TrimSpace(parts[1])
 	}
 	return title, desc
+}
+
+func (b *Bot) forceBuy(ctx context.Context, chatID int64, userID int64, contentID string) error {
+	res, err := b.start.Handle(ctx, start_purchase.Command{UserID: userID, ContentID: contentID})
+	if err != nil {
+		return err
+	}
+
+	chargeID := fmt.Sprintf("forcebuy-%d-%d", userID, time.Now().UnixNano())
+	err = b.confirm.Handle(ctx, confirm_payment.Command{Event: payment.Event{
+		ChargeID:       chargeID,
+		AmountStars:    res.AmountStars,
+		InvoicePayload: res.InvoicePayload,
+		RawPayload:     []byte(`{"source":"forcebuy"}`),
+		OccurredAt:     time.Now(),
+	}})
+	if err != nil {
+		return err
+	}
+
+	b.reply(chatID, fmt.Sprintf("Force purchase created and paid.\nPurchase ID: %s", res.PurchaseID))
+	return nil
 }
