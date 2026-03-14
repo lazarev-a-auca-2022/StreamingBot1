@@ -91,6 +91,10 @@ func (b *Bot) Start(ctx context.Context) error {
 }
 
 func (b *Bot) handleUpdate(ctx context.Context, up tgbotapi.Update) {
+	if up.PreCheckoutQuery != nil {
+		b.handlePreCheckout(ctx, up.PreCheckoutQuery)
+		return
+	}
 	if up.Message != nil {
 		b.handleMessage(ctx, up.Message)
 		return
@@ -106,6 +110,23 @@ func (b *Bot) handleMessage(ctx context.Context, msg *tgbotapi.Message) {
 	}
 	chatID := msg.Chat.ID
 	userID := msg.From.ID
+
+	if msg.SuccessfulPayment != nil {
+		sp := msg.SuccessfulPayment
+		err := b.confirm.Handle(ctx, confirm_payment.Command{Event: payment.Event{
+			ChargeID:       sp.TelegramPaymentChargeID,
+			AmountStars:    sp.TotalAmount,
+			InvoicePayload: sp.InvoicePayload,
+			RawPayload:     []byte(fmt.Sprintf(`{"currency":"%s","telegram_payment_charge_id":"%s"}`, sp.Currency, sp.TelegramPaymentChargeID)),
+			OccurredAt:     time.Now(),
+		}})
+		if err != nil {
+			b.reply(chatID, "Payment received, but confirmation failed. Please contact support.")
+			return
+		}
+		b.reply(chatID, "Payment received. Preparing your access link...")
+		return
+	}
 
 	if msg.IsCommand() {
 		switch msg.Command() {
@@ -331,7 +352,36 @@ func (b *Bot) startPurchase(ctx context.Context, chatID int64, userID int64, con
 		b.reply(chatID, "Could not start purchase. Check content ID.")
 		return
 	}
-	b.reply(chatID, fmt.Sprintf("Purchase created.\nPurchase ID: %s\nPrice: %d⭐\nWaiting for payment confirmation.", res.PurchaseID, res.AmountStars))
+
+	item, _ := b.catalog.GetByID(ctx, contentID)
+	title := "Streaming Content"
+	desc := "Access to purchased content"
+	if item != nil {
+		if strings.TrimSpace(item.Title) != "" {
+			title = item.Title
+		}
+		if strings.TrimSpace(item.Description) != "" {
+			desc = item.Description
+		}
+	}
+
+	prices := []tgbotapi.LabeledPrice{{Label: title, Amount: res.AmountStars}}
+	invoice := tgbotapi.NewInvoice(
+		chatID,
+		title,
+		desc,
+		res.InvoicePayload,
+		"", // provider token not used for XTR
+		"purchase_"+res.PurchaseID,
+		"XTR",
+		prices,
+	)
+
+	if _, err := b.api.Send(invoice); err != nil {
+		b.reply(chatID, fmt.Sprintf("Purchase created, but invoice send failed. Purchase ID: %s", res.PurchaseID))
+		return
+	}
+	b.reply(chatID, fmt.Sprintf("Purchase created.\nPurchase ID: %s\nPlease complete Telegram Stars payment.", res.PurchaseID))
 }
 
 func (b *Bot) ack(callbackID, text string) {
@@ -380,6 +430,43 @@ func splitTitleDesc(raw string) (string, string) {
 		desc = strings.TrimSpace(parts[1])
 	}
 	return title, desc
+}
+
+func (b *Bot) handlePreCheckout(ctx context.Context, q *tgbotapi.PreCheckoutQuery) {
+	if q == nil {
+		return
+	}
+	resp := tgbotapi.PreCheckoutConfig{
+		PreCheckoutQueryID: q.ID,
+		OK:                 false,
+	}
+
+	if q.Currency != "XTR" {
+		resp.ErrorMessage = "Unsupported currency"
+		_, _ = b.api.Request(resp)
+		return
+	}
+
+	p, err := b.start.Purchases.GetByPayload(ctx, q.InvoicePayload)
+	if err != nil || p == nil {
+		resp.ErrorMessage = "Invoice not found"
+		_, _ = b.api.Request(resp)
+		return
+	}
+	if p.UserID != q.From.ID {
+		resp.ErrorMessage = "Invoice owner mismatch"
+		_, _ = b.api.Request(resp)
+		return
+	}
+	if p.StarsAmount != q.TotalAmount {
+		resp.ErrorMessage = "Price mismatch"
+		_, _ = b.api.Request(resp)
+		return
+	}
+
+	resp.OK = true
+	resp.ErrorMessage = ""
+	_, _ = b.api.Request(resp)
 }
 
 func (b *Bot) forceBuy(ctx context.Context, chatID int64, userID int64, contentID string) error {
