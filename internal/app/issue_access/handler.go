@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"streamingbot/internal/domain/access"
 	"streamingbot/internal/domain/content"
 	"streamingbot/internal/domain/purchase"
@@ -80,7 +81,7 @@ func (h Handler) Handle(ctx context.Context, cmd Command) error {
 		now = h.Now()
 	}
 	grant := access.Grant{
-		ID:         "",
+		ID:         fmt.Sprintf("grant-%s", p.ID),
 		PurchaseID: p.ID,
 		UserID:     p.UserID,
 		TokenHash:  tokenHash,
@@ -98,5 +99,6 @@ func (h Handler) Handle(ctx context.Context, cmd Command) error {
 		return err
 	}
 
-	return h.Sender.SendAccessLink(ctx, p.UserID, link)
+	finalLink := fmt.Sprintf("%s?token=%s", link, tokenRaw)
+	return h.Sender.SendAccessLink(ctx, p.UserID, finalLink)
 }

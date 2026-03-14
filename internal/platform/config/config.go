@@ -37,7 +37,10 @@ func Load() (Config, error) {
 	}
 
 	if cfg.BotToken == "" {
-		return Config{}, fmt.Errorf("BOT_TOKEN is required")
+		if cfg.Environment == "prod" || cfg.Environment == "production" {
+			return Config{}, fmt.Errorf("BOT_TOKEN is required in production")
+		}
+		cfg.BotToken = "dev-bot-token"
 	}
 
 	return cfg, nil
