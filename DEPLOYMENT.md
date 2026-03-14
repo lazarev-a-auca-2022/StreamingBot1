@@ -44,6 +44,8 @@ Minimum required values:
 - BUNNY_API_KEY=...
 - BUNNY_API_BASE_URL=https://video.bunnycdn.com
 - BUNNY_EMBED_BASE_URL=https://iframe.mediadelivery.net/embed
+- BUNNY_SYNC_INTERVAL_SEC=300
+- BUNNY_DEFAULT_PRICE_STARS=25
 
 Defaults in `.env.example` are suitable for local development.
 
@@ -55,6 +57,10 @@ Defaults in `.env.example` are suitable for local development.
   - Header: `AccessKey: {BUNNY_API_KEY}`
 - Issued access links are Bunny embed URLs:
   - `{BUNNY_EMBED_BASE_URL}/{BUNNY_LIBRARY_ID}/{videoId}`
+- Content catalog auto-sync:
+  - On startup, app fetches Bunny library videos and upserts into local `content` table.
+  - Then it refreshes periodically every `BUNNY_SYNC_INTERVAL_SEC`.
+  - New videos get `price_stars = BUNNY_DEFAULT_PRICE_STARS` by default.
 
 ---
 

@@ -46,9 +46,6 @@ func main() {
 	if err := postgres.EnsureSchema(ctx, db); err != nil {
 		log.Fatalf("ensure schema: %v", err)
 	}
-	if err := postgres.EnsureDemoContent(ctx, db); err != nil {
-		log.Fatalf("seed content: %v", err)
-	}
 
 	tokenCache, err := redis.NewTokenStore(cfg.RedisURL)
 	if err != nil {
@@ -66,22 +63,28 @@ func main() {
 	idempotencyRepo := postgres.NewIdempotencyRepo(db)
 	eventLogRepo := postgres.NewEventLogRepo(db)
 	outboxRepo := postgres.NewOutboxRepo(db)
+	bunnyClient := streaming.NewBunnyClient(cfg.BunnyLibraryID, cfg.BunnyAPIKey, cfg.BunnyAPIBaseURL, cfg.BunnyEmbedBaseURL, cfg.BunnyTokenAuthKey)
+
+	if cfg.BunnyLibraryID != "" && cfg.BunnyAPIKey != "" {
+		synced, err := streaming.SyncLibraryContent(ctx, bunnyClient, contentRepo, cfg.BunnyDefaultPrice)
+		if err != nil {
+			if cfg.Environment == "production" || cfg.Environment == "prod" {
+				log.Fatalf("initial bunny sync failed: %v", err)
+			}
+			log.Printf("initial bunny sync failed: %v", err)
+		} else {
+			log.Printf("initial bunny sync complete: %d items", synced)
+		}
+	} else {
+		if err := postgres.EnsureDemoContent(ctx, db); err != nil {
+			log.Fatalf("seed content: %v", err)
+		}
+	}
 
 	startPurchaseUC := start_purchase.Handler{
 		Purchases: purchaseRepo,
 		Contents:  contentRepo,
 		IDs:       idgen.NewService(),
-	}
-	issueAccessUC := issue_access.Handler{
-		Purchases:  purchaseRepo,
-		Contents:   contentRepo,
-		Grants:     accessRepo,
-		Provider:   streaming.NewBunnyClient(cfg.BunnyLibraryID, cfg.BunnyAPIKey, cfg.BunnyAPIBaseURL, cfg.BunnyEmbedBaseURL, cfg.BunnyTokenAuthKey),
-		Tokens:     crypto.NewTokenService(),
-		Sender:     telegram.NewSender(nil),
-		Cache:      tokenCache,
-		TTL:        time.Duration(cfg.AccessLinkTTLMinutes) * time.Minute,
-		MaxRetries: 3,
 	}
 	confirmPaymentUC := confirm_payment.Handler{
 		Purchases:   purchaseRepo,
@@ -89,8 +92,65 @@ func main() {
 		EventLog:    eventLogRepo,
 		Outbox:      outboxRepo,
 	}
-	useAccessUC := use_access.Handler{Grants: accessRepo, Cache: tokenCache}
 	submitReviewUC := submit_review.Handler{Purchases: purchaseRepo, Reviews: reviewRepo}
+	telegramSender := telegram.NewSender(nil)
+	var tgBot *telegram.Bot
+	if cfg.TelegramPolling {
+		var err error
+		tgBot, err = telegram.NewBot(cfg.BotToken, cfg.TelegramPollTimeout, cfg.WebhookSecret, contentRepo, startPurchaseUC, confirmPaymentUC, submitReviewUC)
+		if err != nil {
+			if cfg.Environment == "production" || cfg.Environment == "prod" {
+				log.Fatalf("telegram bot init: %v", err)
+			}
+			log.Printf("telegram bot disabled (init error): %v", err)
+			tgBot = nil
+		} else {
+			telegramSender = telegram.NewSender(tgBot.API())
+		}
+	}
+
+	issueAccessUC := issue_access.Handler{
+		Purchases:  purchaseRepo,
+		Contents:   contentRepo,
+		Grants:     accessRepo,
+		Provider:   bunnyClient,
+		Tokens:     crypto.NewTokenService(),
+		Sender:     telegramSender,
+		Cache:      tokenCache,
+		TTL:        time.Duration(cfg.AccessLinkTTLMinutes) * time.Minute,
+		MaxRetries: 3,
+	}
+	useAccessUC := use_access.Handler{Grants: accessRepo, Cache: tokenCache}
+
+	if tgBot != nil {
+		go func() {
+			if err := tgBot.Start(ctx); err != nil {
+				log.Printf("telegram bot stopped: %v", err)
+			}
+		}()
+	}
+
+	if cfg.BunnyLibraryID != "" && cfg.BunnyAPIKey != "" && cfg.BunnySyncIntervalSec > 0 {
+		go func() {
+			ticker := time.NewTicker(time.Duration(cfg.BunnySyncIntervalSec) * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					synced, err := streaming.SyncLibraryContent(ctx, bunnyClient, contentRepo, cfg.BunnyDefaultPrice)
+					if err != nil {
+						log.Printf("bunny periodic sync failed: %v", err)
+						continue
+					}
+					if synced > 0 {
+						log.Printf("bunny periodic sync complete: %d items", synced)
+					}
+				}
+			}
+		}()
+	}
 
 	api := httpapi.Server{
 		Catalog:        contentRepo,
@@ -107,23 +167,6 @@ func main() {
 	}
 	scheduler := jobs.NewScheduler(2 * time.Second)
 	go scheduler.Start(ctx, processor.RunOnce)
-
-	if cfg.TelegramPolling {
-		tgBot, err := telegram.NewBot(cfg.BotToken, cfg.TelegramPollTimeout, cfg.WebhookSecret, contentRepo, startPurchaseUC, confirmPaymentUC, submitReviewUC)
-		if err != nil {
-			if cfg.Environment == "production" || cfg.Environment == "prod" {
-				log.Fatalf("telegram bot init: %v", err)
-			}
-			log.Printf("telegram bot disabled (init error): %v", err)
-		} else {
-			issueAccessUC.Sender = telegram.NewSender(tgBot.API())
-			go func() {
-				if err := tgBot.Start(ctx); err != nil {
-					log.Printf("telegram bot stopped: %v", err)
-				}
-			}()
-		}
-	}
 
 	go func() {
 		if err := httpapi.StartServer(ctx, cfg.HTTPAddr, api.Handler()); err != nil && !errors.Is(err, http.ErrServerClosed) {

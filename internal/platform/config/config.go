@@ -20,6 +20,8 @@ type Config struct {
 	BunnyAPIBaseURL      string
 	BunnyEmbedBaseURL    string
 	BunnyTokenAuthKey    string
+	BunnySyncIntervalSec int
+	BunnyDefaultPrice    int
 	AccessLinkTTLMinutes int
 	ReviewDelayHours     int
 	RateLimitPerMinute   int
@@ -41,6 +43,8 @@ func Load() (Config, error) {
 		BunnyAPIBaseURL:      getenvDefault("BUNNY_API_BASE_URL", "https://video.bunnycdn.com"),
 		BunnyEmbedBaseURL:    getenvDefault("BUNNY_EMBED_BASE_URL", "https://iframe.mediadelivery.net/embed"),
 		BunnyTokenAuthKey:    os.Getenv("BUNNY_TOKEN_AUTH_KEY"),
+		BunnySyncIntervalSec: getenvInt("BUNNY_SYNC_INTERVAL_SEC", 300),
+		BunnyDefaultPrice:    getenvInt("BUNNY_DEFAULT_PRICE_STARS", 25),
 		AccessLinkTTLMinutes: getenvInt("ACCESS_LINK_TTL_MINUTES", 1440),
 		ReviewDelayHours:     getenvInt("REVIEW_DELAY_HOURS", 24),
 		RateLimitPerMinute:   getenvInt("RATE_LIMIT_PER_MINUTE", 10),
