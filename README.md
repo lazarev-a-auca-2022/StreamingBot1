@@ -232,7 +232,7 @@ func (s *Scheduler) Start(ctx context.Context) {
 ```json
 {
     "error": "invalid_credentials",
-    "message": "streaming_api_key неверный или истёк"
+    "message": "bunny_api_key неверный или истёк"
 }
 ```
 
@@ -839,8 +839,11 @@ sched.Start(ctx)  // остановится после context timeout или ct
 | `WEBHOOK_SECRET`              | секрет для верификации `x-telegram-bot-api-secret-token`  | (random 32+ символа) |
 | `DATABASE_URL`                | строка подключения к postgresql (DSN)                    | `postgres://user:pass@localhost/streamingbot?sslmode=disable` |
 | `REDIS_URL`                   | строка подключения к redis                                | `redis://localhost:6379/0` |
-| `STREAMING_API_URL`           | базовый url внешнего streaming api                        | `https://streaming.example.com/api/v1` |
-| `STREAMING_API_KEY`           | ключ доступа к streaming api (передаётся в Authorization) | (bearer token) |
+| `BUNNY_LIBRARY_ID`            | id Bunny Stream library                                   | `123456` |
+| `BUNNY_API_KEY`               | Bunny Stream API key (AccessKey header)                   | (from bunny dashboard) |
+| `BUNNY_API_BASE_URL`          | Bunny Stream API base URL                                 | `https://video.bunnycdn.com` |
+| `BUNNY_EMBED_BASE_URL`        | Bunny embed base URL                                      | `https://iframe.mediadelivery.net/embed` |
+| `BUNNY_TOKEN_AUTH_KEY`        | optional app-side signature key                           | (random secret) |
 | `STREAMING_API_TIMEOUT_SEC`   | timeout запроса к streaming provider (сек)                | `5` |
 | `TOKEN_HMAC_SECRET`           | секрет для hmac-подписи access токенов (hex, 32+ байт)    | (openssl rand -hex 32) |
 | `ENCRYPTION_KEY`              | ключ aes-256-gcm для content.external_ref (hex, ровно 32 байта | (openssl rand -hex 32) |
@@ -997,7 +1000,7 @@ sched.Start(ctx)  // остановится после context timeout или ct
 
 ```bash
 cp .env.example .env
-# заполнить .env реальными значениями (BOT_TOKEN, STREAMING_API_KEY, etc.)
+# заполнить .env реальными значениями (BOT_TOKEN, BUNNY_API_KEY, BUNNY_LIBRARY_ID, etc.)
 docker compose up -d
 ```
 

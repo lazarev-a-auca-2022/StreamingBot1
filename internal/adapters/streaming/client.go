@@ -1,71 +1,85 @@
 package streaming
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
-	"errors"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
 	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
 	"time"
 )
 
+// Client is a Bunny Stream specific implementation.
 type Client struct {
-	httpClient *http.Client
-	baseURL    string
-	apiKey     string
+	httpClient      *http.Client
+	apiBaseURL      string
+	embedBaseURL    string
+	libraryID       string
+	apiKey          string
+	tokenAuthSecret string
 }
 
-func NewClient(baseURL, apiKey string) Client {
+func NewBunnyClient(libraryID, apiKey, apiBaseURL, embedBaseURL, tokenAuthSecret string) Client {
+	if strings.TrimSpace(apiBaseURL) == "" {
+		apiBaseURL = "https://video.bunnycdn.com"
+	}
+	if strings.TrimSpace(embedBaseURL) == "" {
+		embedBaseURL = "https://iframe.mediadelivery.net/embed"
+	}
 	return Client{
-		httpClient: &http.Client{Timeout: 5 * time.Second},
-		baseURL:    baseURL,
-		apiKey:     apiKey,
+		httpClient:      &http.Client{Timeout: 8 * time.Second},
+		apiBaseURL:      strings.TrimRight(apiBaseURL, "/"),
+		embedBaseURL:    strings.TrimRight(embedBaseURL, "/"),
+		libraryID:       libraryID,
+		apiKey:          apiKey,
+		tokenAuthSecret: tokenAuthSecret,
 	}
 }
 
 func (c Client) IssueAccessLink(ctx context.Context, externalRef []byte, userID int64, ttl time.Duration, idempotencyKey string) (string, time.Time, error) {
-	if c.baseURL == "" {
-		expiresAt := time.Now().Add(ttl)
-		return "https://example.invalid/watch", expiresAt, nil
+	videoID := strings.TrimSpace(string(externalRef))
+	if videoID == "" {
+		return "", time.Time{}, fmt.Errorf("empty bunny video id")
+	}
+	if c.libraryID == "" {
+		return "", time.Time{}, fmt.Errorf("missing bunny library id")
+	}
+	if c.apiKey == "" {
+		return "", time.Time{}, fmt.Errorf("missing bunny api key")
 	}
 
-	reqBody := map[string]any{
-		"external_ref":    string(externalRef),
-		"user_id":         userID,
-		"ttl_minutes":     int(ttl.Minutes()),
-		"idempotency_key": idempotencyKey,
-	}
-	b, _ := json.Marshal(reqBody)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/v1/access/issue-link", bytes.NewReader(b))
+	// Validate video exists in Bunny Stream before issuing access.
+	checkURL := fmt.Sprintf("%s/library/%s/videos/%s", c.apiBaseURL, url.PathEscape(c.libraryID), url.PathEscape(videoID))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, checkURL, nil)
 	if err != nil {
 		return "", time.Time{}, err
 	}
-	req.Header.Set("Content-Type", "application/json")
-	if c.apiKey != "" {
-		req.Header.Set("Authorization", "Bearer "+c.apiKey)
-	}
+	req.Header.Set("AccessKey", c.apiKey)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return "", time.Time{}, err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", time.Time{}, fmt.Errorf("bunny api returned status %d", resp.StatusCode)
+	}
 
-	var out struct {
-		Link      string    `json:"link"`
-		ExpiresAt time.Time `json:"expires_at"`
+	expiresAt := time.Now().Add(ttl)
+	playURL := fmt.Sprintf("%s/%s/%s", c.embedBaseURL, url.PathEscape(c.libraryID), url.PathEscape(videoID))
+	q := url.Values{}
+	q.Set("uid", strconv.FormatInt(userID, 10))
+	q.Set("pid", idempotencyKey)
+	q.Set("expires", strconv.FormatInt(expiresAt.Unix(), 10))
+
+	if c.tokenAuthSecret != "" {
+		sigPayload := fmt.Sprintf("%s|%d|%d|%s", videoID, userID, expiresAt.Unix(), idempotencyKey)
+		digest := sha256.Sum256([]byte(c.tokenAuthSecret + ":" + sigPayload))
+		q.Set("sig", hex.EncodeToString(digest[:]))
 	}
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusConflict {
-		return "", time.Time{}, errors.New("streaming provider returned non-success")
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return "", time.Time{}, err
-	}
-	if out.Link == "" {
-		return "", time.Time{}, errors.New("streaming provider returned empty link")
-	}
-	if out.ExpiresAt.IsZero() {
-		out.ExpiresAt = time.Now().Add(ttl)
-	}
-	return out.Link, out.ExpiresAt, nil
+
+	return playURL + "?" + q.Encode(), expiresAt, nil
 }

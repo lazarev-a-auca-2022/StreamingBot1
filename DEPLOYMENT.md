@@ -40,10 +40,21 @@ Minimum required values:
 - WEBHOOK_SECRET=...
 - DATABASE_URL=postgres://...
 - REDIS_URL=redis://...
-- STREAMING_API_URL=...
-- STREAMING_API_KEY=...
+- BUNNY_LIBRARY_ID=...
+- BUNNY_API_KEY=...
+- BUNNY_API_BASE_URL=https://video.bunnycdn.com
+- BUNNY_EMBED_BASE_URL=https://iframe.mediadelivery.net/embed
 
 Defaults in `.env.example` are suitable for local development.
+
+### Bunny Stream mapping
+
+- `content.external_ref` in DB must contain Bunny `videoId` as bytes/text.
+- App validates video existence via Bunny API:
+  - `GET {BUNNY_API_BASE_URL}/library/{BUNNY_LIBRARY_ID}/videos/{videoId}`
+  - Header: `AccessKey: {BUNNY_API_KEY}`
+- Issued access links are Bunny embed URLs:
+  - `{BUNNY_EMBED_BASE_URL}/{BUNNY_LIBRARY_ID}/{videoId}`
 
 ---
 

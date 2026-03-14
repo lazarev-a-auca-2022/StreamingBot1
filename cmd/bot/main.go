@@ -76,7 +76,7 @@ func main() {
 		Purchases:  purchaseRepo,
 		Contents:   contentRepo,
 		Grants:     accessRepo,
-		Provider:   streaming.NewClient(cfg.StreamingAPIURL, cfg.StreamingAPIKey),
+		Provider:   streaming.NewBunnyClient(cfg.BunnyLibraryID, cfg.BunnyAPIKey, cfg.BunnyAPIBaseURL, cfg.BunnyEmbedBaseURL, cfg.BunnyTokenAuthKey),
 		Tokens:     crypto.NewTokenService(),
 		Sender:     telegram.NewSender(),
 		Cache:      tokenCache,
