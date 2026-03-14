@@ -8,6 +8,7 @@ import (
 	"os/signal"
 	"streamingbot/internal/adapters/httpapi"
 	"streamingbot/internal/adapters/storage/postgres"
+	"streamingbot/internal/adapters/storage/redis"
 	"streamingbot/internal/adapters/streaming"
 	"streamingbot/internal/adapters/telegram"
 	"streamingbot/internal/app/confirm_payment"
@@ -15,7 +16,6 @@ import (
 	"streamingbot/internal/app/start_purchase"
 	"streamingbot/internal/app/submit_review"
 	"streamingbot/internal/app/use_access"
-	"streamingbot/internal/domain/content"
 	"streamingbot/internal/jobs"
 	"streamingbot/internal/platform/config"
 	"streamingbot/internal/platform/crypto"
@@ -37,16 +37,35 @@ func main() {
 	lg := logger.New(cfg.LogLevel)
 	lg.Info("streamingbot bootstrap started")
 
-	contentRepo := postgres.NewContentRepo()
-	purchaseRepo := postgres.NewPurchaseRepo()
-	accessRepo := postgres.NewAccessRepo()
-	reviewRepo := postgres.NewReviewRepo()
-	_ = reviewRepo
-	idempotencyRepo := postgres.NewIdempotencyRepo()
-	eventLogRepo := postgres.NewEventLogRepo()
-	outboxRepo := postgres.NewOutboxRepo()
+	db, err := postgres.Open(ctx, cfg.DatabaseURL)
+	if err != nil {
+		log.Fatalf("open postgres: %v", err)
+	}
+	defer db.Close()
 
-	seedContent(contentRepo)
+	if err := postgres.EnsureSchema(ctx, db); err != nil {
+		log.Fatalf("ensure schema: %v", err)
+	}
+	if err := postgres.EnsureDemoContent(ctx, db); err != nil {
+		log.Fatalf("seed content: %v", err)
+	}
+
+	tokenCache, err := redis.NewTokenStore(cfg.RedisURL)
+	if err != nil {
+		log.Fatalf("open redis: %v", err)
+	}
+	defer func() { _ = tokenCache.Close() }()
+	if err := tokenCache.Ping(ctx); err != nil {
+		log.Fatalf("ping redis: %v", err)
+	}
+
+	contentRepo := postgres.NewContentRepo(db)
+	purchaseRepo := postgres.NewPurchaseRepo(db)
+	accessRepo := postgres.NewAccessRepo(db)
+	reviewRepo := postgres.NewReviewRepo(db)
+	idempotencyRepo := postgres.NewIdempotencyRepo(db)
+	eventLogRepo := postgres.NewEventLogRepo(db)
+	outboxRepo := postgres.NewOutboxRepo(db)
 
 	startPurchaseUC := start_purchase.Handler{
 		Purchases: purchaseRepo,
@@ -60,6 +79,7 @@ func main() {
 		Provider:   streaming.NewClient(cfg.StreamingAPIURL, cfg.StreamingAPIKey),
 		Tokens:     crypto.NewTokenService(),
 		Sender:     telegram.NewSender(),
+		Cache:      tokenCache,
 		TTL:        time.Duration(cfg.AccessLinkTTLMinutes) * time.Minute,
 		MaxRetries: 3,
 	}
@@ -69,7 +89,7 @@ func main() {
 		EventLog:    eventLogRepo,
 		Outbox:      outboxRepo,
 	}
-	useAccessUC := use_access.Handler{Grants: accessRepo}
+	useAccessUC := use_access.Handler{Grants: accessRepo, Cache: tokenCache}
 	submitReviewUC := submit_review.Handler{Purchases: purchaseRepo, Reviews: reviewRepo}
 
 	api := httpapi.Server{
@@ -89,13 +109,13 @@ func main() {
 	go scheduler.Start(ctx, processor.RunOnce)
 
 	go func() {
-		if err := httpapi.StartServer(ctx, ":8080", api.Handler()); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := httpapi.StartServer(ctx, cfg.HTTPAddr, api.Handler()); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Printf("server error: %v", err)
 			stop()
 		}
 	}()
 
-	lg.Info("streamingbot server listening on :8080")
+	lg.Info("streamingbot server listening on " + cfg.HTTPAddr)
 	<-ctx.Done()
 	lg.Info("streamingbot shutdown complete")
 }
@@ -118,14 +138,4 @@ func (o outboxAdapter) Unpublished(ctx context.Context, limit int) ([]jobs.Outbo
 
 func (o outboxAdapter) MarkPublished(ctx context.Context, id string) error {
 	return o.repo.MarkPublished(ctx, id)
-}
-
-func seedContent(repo *postgres.ContentRepo) {
-	repo.Seed(content.Content{
-		ID:          "content-demo-1",
-		ExternalRef: []byte("provider:video:demo1"),
-		Title:       "Demo Streaming Content",
-		PriceStars:  25,
-		Active:      true,
-	})
 }

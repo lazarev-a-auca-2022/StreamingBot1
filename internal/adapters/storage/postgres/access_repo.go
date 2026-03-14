@@ -2,72 +2,54 @@ package postgres
 
 import (
 	"context"
+	"database/sql"
 	"streamingbot/internal/domain/access"
-	"sync"
-	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 type AccessRepo struct {
-	mu          sync.RWMutex
-	byID        map[string]access.Grant
-	byPurchase  map[string]access.Grant
-	byTokenHash map[string]string
+	db *pgxpool.Pool
 }
 
-func NewAccessRepo() *AccessRepo {
-	return &AccessRepo{
-		byID:        map[string]access.Grant{},
-		byPurchase:  map[string]access.Grant{},
-		byTokenHash: map[string]string{},
-	}
+func NewAccessRepo(db *pgxpool.Pool) *AccessRepo {
+	return &AccessRepo{db: db}
 }
 
 func (r *AccessRepo) GetByPurchaseID(ctx context.Context, purchaseID string) (*access.Grant, error) {
-	_ = ctx
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	g, ok := r.byPurchase[purchaseID]
-	if !ok {
-		return nil, nil
-	}
-	copy := g
-	return &copy, nil
+	return r.getOne(ctx, `SELECT id, purchase_id, user_id, token_hash, issued_at, expires_at, used_at FROM access_grants WHERE purchase_id=$1`, purchaseID)
 }
 
 func (r *AccessRepo) GetByTokenHash(ctx context.Context, tokenHash string) (*access.Grant, error) {
-	_ = ctx
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	purchaseID, ok := r.byTokenHash[tokenHash]
-	if !ok {
-		return nil, nil
-	}
-	g := r.byPurchase[purchaseID]
-	copy := g
-	return &copy, nil
+	return r.getOne(ctx, `SELECT id, purchase_id, user_id, token_hash, issued_at, expires_at, used_at FROM access_grants WHERE token_hash=$1`, tokenHash)
 }
 
 func (r *AccessRepo) Create(ctx context.Context, g access.Grant) error {
-	_ = ctx
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.byID[g.ID] = g
-	r.byPurchase[g.PurchaseID] = g
-	r.byTokenHash[g.TokenHash] = g.PurchaseID
-	return nil
+	_, err := r.db.Exec(ctx, `
+		INSERT INTO access_grants(id, purchase_id, user_id, token_hash, issued_at, expires_at, used_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7)
+	`, g.ID, g.PurchaseID, g.UserID, g.TokenHash, g.IssuedAt, g.ExpiresAt, g.UsedAt)
+	return err
 }
 
 func (r *AccessRepo) MarkUsed(ctx context.Context, grantID string) error {
-	_ = ctx
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	g, ok := r.byID[grantID]
-	if !ok {
-		return nil
+	_, err := r.db.Exec(ctx, `UPDATE access_grants SET used_at=NOW() WHERE id=$1 AND used_at IS NULL`, grantID)
+	return err
+}
+
+func (r *AccessRepo) getOne(ctx context.Context, q string, arg any) (*access.Grant, error) {
+	var g access.Grant
+	var usedAt sql.NullTime
+	err := r.db.QueryRow(ctx, q, arg).Scan(&g.ID, &g.PurchaseID, &g.UserID, &g.TokenHash, &g.IssuedAt, &g.ExpiresAt, &usedAt)
+	if err != nil {
+		if isNoRows(err) {
+			return nil, nil
+		}
+		return nil, err
 	}
-	now := time.Now()
-	g.UsedAt = &now
-	r.byID[grantID] = g
-	r.byPurchase[g.PurchaseID] = g
-	return nil
+	if usedAt.Valid {
+		t := usedAt.Time
+		g.UsedAt = &t
+	}
+	return &g, nil
 }

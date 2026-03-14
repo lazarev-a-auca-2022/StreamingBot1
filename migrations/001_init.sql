@@ -1,0 +1,2 @@
+-- Placeholder migration script for external migration tooling.
+-- Runtime schema is auto-ensured at startup in internal/adapters/storage/postgres/schema.go.

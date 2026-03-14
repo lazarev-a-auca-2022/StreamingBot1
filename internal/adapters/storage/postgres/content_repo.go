@@ -3,45 +3,53 @@ package postgres
 import (
 	"context"
 	"streamingbot/internal/domain/content"
-	"sync"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 type ContentRepo struct {
-	mu   sync.RWMutex
-	byID map[string]content.Content
+	db *pgxpool.Pool
 }
 
-func NewContentRepo() *ContentRepo {
-	return &ContentRepo{byID: map[string]content.Content{}}
+func NewContentRepo(db *pgxpool.Pool) *ContentRepo {
+	return &ContentRepo{db: db}
 }
 
 func (r *ContentRepo) GetByID(ctx context.Context, id string) (*content.Content, error) {
-	_ = ctx
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	c, ok := r.byID[id]
-	if !ok {
-		return nil, nil
+	var c content.Content
+	err := r.db.QueryRow(ctx, `SELECT id, external_ref, title, price_stars, active FROM content WHERE id=$1`, id).
+		Scan(&c.ID, &c.ExternalRef, &c.Title, &c.PriceStars, &c.Active)
+	if err != nil {
+		if isNoRows(err) {
+			return nil, nil
+		}
+		return nil, err
 	}
-	copy := c
-	return &copy, nil
+	return &c, nil
 }
 
 func (r *ContentRepo) ListActive(ctx context.Context) ([]content.Content, error) {
-	_ = ctx
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	result := make([]content.Content, 0, len(r.byID))
-	for _, c := range r.byID {
-		if c.Active {
-			result = append(result, c)
-		}
+	rows, err := r.db.Query(ctx, `SELECT id, external_ref, title, price_stars, active FROM content WHERE active=TRUE ORDER BY id`)
+	if err != nil {
+		return nil, err
 	}
-	return result, nil
+	defer rows.Close()
+
+	var result []content.Content
+	for rows.Next() {
+		var c content.Content
+		if err := rows.Scan(&c.ID, &c.ExternalRef, &c.Title, &c.PriceStars, &c.Active); err != nil {
+			return nil, err
+		}
+		result = append(result, c)
+	}
+	return result, rows.Err()
 }
 
 func (r *ContentRepo) Seed(c content.Content) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.byID[c.ID] = c
+	_, _ = r.db.Exec(context.Background(), `
+		INSERT INTO content(id, external_ref, title, price_stars, active)
+		VALUES ($1,$2,$3,$4,$5)
+		ON CONFLICT (id) DO NOTHING
+	`, c.ID, c.ExternalRef, c.Title, c.PriceStars, c.Active)
 }

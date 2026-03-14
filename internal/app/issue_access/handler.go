@@ -30,6 +30,10 @@ type TelegramSender interface {
 	SendAccessLink(ctx context.Context, userID int64, link string) error
 }
 
+type TokenCache interface {
+	Put(ctx context.Context, tokenHash string, purchaseID string, ttl time.Duration) error
+}
+
 type Handler struct {
 	Purchases  purchase.Repository
 	Contents   content.Repository
@@ -37,6 +41,7 @@ type Handler struct {
 	Provider   StreamingProvider
 	Tokens     TokenService
 	Sender     TelegramSender
+	Cache      TokenCache
 	Now        func() time.Time
 	TTL        time.Duration
 	MaxRetries int
@@ -90,6 +95,9 @@ func (h Handler) Handle(ctx context.Context, cmd Command) error {
 	}
 	if err := h.Grants.Create(ctx, grant); err != nil {
 		return err
+	}
+	if h.Cache != nil {
+		_ = h.Cache.Put(ctx, tokenHash, p.ID, time.Until(expiresAt))
 	}
 
 	if err := p.MarkAccessIssued(); err != nil {

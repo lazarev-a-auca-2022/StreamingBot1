@@ -3,22 +3,23 @@ package postgres
 import (
 	"context"
 	"streamingbot/internal/domain/payment"
-	"sync"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 type EventLogRepo struct {
-	mu     sync.Mutex
-	events []payment.Event
+	db *pgxpool.Pool
 }
 
-func NewEventLogRepo() *EventLogRepo {
-	return &EventLogRepo{events: []payment.Event{}}
+func NewEventLogRepo(db *pgxpool.Pool) *EventLogRepo {
+	return &EventLogRepo{db: db}
 }
 
 func (r *EventLogRepo) SavePaymentEvent(ctx context.Context, event payment.Event) error {
-	_ = ctx
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.events = append(r.events, event)
-	return nil
+	_, err := r.db.Exec(ctx, `
+		INSERT INTO payment_events(charge_id, amount_stars, invoice_payload, raw_payload, occurred_at)
+		VALUES ($1,$2,$3,$4,$5)
+		ON CONFLICT (charge_id) DO NOTHING
+	`, event.ChargeID, event.AmountStars, event.InvoicePayload, event.RawPayload, event.OccurredAt)
+	return err
 }

@@ -3,8 +3,9 @@ package postgres
 import (
 	"context"
 	"fmt"
-	"sync"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 type OutboxEvent struct {
@@ -16,63 +17,50 @@ type OutboxEvent struct {
 }
 
 type OutboxRepo struct {
-	mu     sync.Mutex
-	events []OutboxEvent
-	nextID int
+	db *pgxpool.Pool
 }
 
-func NewOutboxRepo() *OutboxRepo {
-	return &OutboxRepo{events: []OutboxEvent{}, nextID: 1}
+func NewOutboxRepo(db *pgxpool.Pool) *OutboxRepo {
+	return &OutboxRepo{db: db}
 }
 
 func (r *OutboxRepo) PublishPurchaseConfirmed(ctx context.Context, purchaseID string) error {
-	_ = ctx
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	e := OutboxEvent{
-		ID:         r.newID(),
-		Type:       "purchase_confirmed",
-		PurchaseID: purchaseID,
-		CreatedAt:  time.Now(),
-	}
-	r.events = append(r.events, e)
-	return nil
+	id := fmt.Sprintf("%d-%s", time.Now().UnixNano(), purchaseID)
+	_, err := r.db.Exec(ctx, `
+		INSERT INTO outbox_events(id, event_type, purchase_id, published)
+		VALUES ($1, 'purchase_confirmed', $2, FALSE)
+	`, id, purchaseID)
+	return err
 }
 
 func (r *OutboxRepo) Unpublished(ctx context.Context, limit int) ([]OutboxEvent, error) {
-	_ = ctx
-	r.mu.Lock()
-	defer r.mu.Unlock()
 	if limit <= 0 {
-		limit = 10
+		limit = 20
 	}
-	res := make([]OutboxEvent, 0, limit)
-	for _, e := range r.events {
-		if !e.Published {
-			res = append(res, e)
-			if len(res) >= limit {
-				break
-			}
+	rows, err := r.db.Query(ctx, `
+		SELECT id, event_type, purchase_id, created_at, published
+		FROM outbox_events
+		WHERE published=FALSE
+		ORDER BY created_at ASC
+		LIMIT $1
+	`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var result []OutboxEvent
+	for rows.Next() {
+		var e OutboxEvent
+		if err := rows.Scan(&e.ID, &e.Type, &e.PurchaseID, &e.CreatedAt, &e.Published); err != nil {
+			return nil, err
 		}
+		result = append(result, e)
 	}
-	return res, nil
+	return result, rows.Err()
 }
 
 func (r *OutboxRepo) MarkPublished(ctx context.Context, id string) error {
-	_ = ctx
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	for i := range r.events {
-		if r.events[i].ID == id {
-			r.events[i].Published = true
-			break
-		}
-	}
-	return nil
-}
-
-func (r *OutboxRepo) newID() string {
-	id := r.nextID
-	r.nextID++
-	return fmt.Sprintf("%d-%d", time.Now().UnixNano(), id)
+	_, err := r.db.Exec(ctx, `UPDATE outbox_events SET published=TRUE WHERE id=$1`, id)
+	return err
 }

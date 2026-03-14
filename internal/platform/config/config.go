@@ -10,6 +10,7 @@ import (
 type Config struct {
 	BotToken             string
 	WebhookSecret        string
+	HTTPAddr             string
 	DatabaseURL          string
 	RedisURL             string
 	StreamingAPIURL      string
@@ -25,8 +26,9 @@ func Load() (Config, error) {
 	cfg := Config{
 		BotToken:             os.Getenv("BOT_TOKEN"),
 		WebhookSecret:        os.Getenv("WEBHOOK_SECRET"),
-		DatabaseURL:          os.Getenv("DATABASE_URL"),
-		RedisURL:             os.Getenv("REDIS_URL"),
+		HTTPAddr:             getenvDefault("HTTP_ADDR", ":8080"),
+		DatabaseURL:          getenvDefault("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/streamingbot?sslmode=disable"),
+		RedisURL:             getenvDefault("REDIS_URL", "redis://localhost:6379/0"),
 		StreamingAPIURL:      os.Getenv("STREAMING_API_URL"),
 		StreamingAPIKey:      os.Getenv("STREAMING_API_KEY"),
 		AccessLinkTTLMinutes: getenvInt("ACCESS_LINK_TTL_MINUTES", 1440),

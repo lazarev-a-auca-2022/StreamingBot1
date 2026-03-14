@@ -1,0 +1,6 @@
+.git
+.gitignore
+.vscode
+.vscode-insiders
+**/*_test.go
+README.md
