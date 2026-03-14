@@ -308,6 +308,30 @@ Bot menu commands configured via Telegram `setMyCommands`:
 - `/review`
 - `/help`
 
+### 12.1.2 Hidden admin commands
+
+Admin mode is toggled per user and requires webhook secret in chat:
+
+- `/adminmode <webhook_secret>`
+
+If correct, it toggles admin mode on/off for that Telegram user.
+
+Admin-only commands:
+
+- `/createcontent <id> <bunny_video_id> <price> <title>|<description>`
+- `/deletecontent <id>`
+- `/setcontent <id> <price> <title>|<description>`
+
+Examples:
+
+`/adminmode change-me`
+
+`/createcontent yoga-101 a1b2c3d4e5 25 Yoga Basics|Beginner class`
+
+`/setcontent yoga-101 30 Yoga Basics Updated|New description`
+
+`/deletecontent yoga-101`
+
 ### 12.2 Endpoints used in the flow
 
 Health check:

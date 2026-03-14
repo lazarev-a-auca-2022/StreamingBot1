@@ -19,9 +19,11 @@ func EnsureSchema(ctx context.Context, db *pgxpool.Pool) error {
 			id TEXT PRIMARY KEY,
 			external_ref BYTEA NOT NULL,
 			title TEXT NOT NULL,
+			description TEXT NOT NULL DEFAULT '',
 			price_stars INTEGER NOT NULL CHECK (price_stars > 0),
 			active BOOLEAN NOT NULL DEFAULT TRUE
 		);`,
+		`ALTER TABLE content ADD COLUMN IF NOT EXISTS description TEXT NOT NULL DEFAULT '';`,
 		`CREATE TABLE IF NOT EXISTS purchases (
 			id TEXT PRIMARY KEY,
 			user_id BIGINT NOT NULL,

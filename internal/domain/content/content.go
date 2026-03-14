@@ -4,6 +4,7 @@ type Content struct {
 	ID          string
 	ExternalRef []byte
 	Title       string
+	Description string
 	PriceStars  int
 	Active      bool
 }

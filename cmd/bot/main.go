@@ -109,7 +109,7 @@ func main() {
 	go scheduler.Start(ctx, processor.RunOnce)
 
 	if cfg.TelegramPolling {
-		tgBot, err := telegram.NewBot(cfg.BotToken, cfg.TelegramPollTimeout, contentRepo, startPurchaseUC, submitReviewUC)
+		tgBot, err := telegram.NewBot(cfg.BotToken, cfg.TelegramPollTimeout, cfg.WebhookSecret, contentRepo, startPurchaseUC, submitReviewUC)
 		if err != nil {
 			if cfg.Environment == "production" || cfg.Environment == "prod" {
 				log.Fatalf("telegram bot init: %v", err)

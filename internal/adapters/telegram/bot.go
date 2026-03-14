@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 
 	"streamingbot/internal/app/start_purchase"
 	"streamingbot/internal/app/submit_review"
@@ -19,9 +20,17 @@ type Bot struct {
 	start        start_purchase.Handler
 	submitReview submit_review.Handler
 	pollTimeout  int
+	adminSecret  string
+	adminMu      sync.RWMutex
+	adminUsers   map[int64]bool
 }
 
-func NewBot(token string, pollTimeout int, catalog content.Repository, start start_purchase.Handler, submit submit_review.Handler) (*Bot, error) {
+type contentAdminRepository interface {
+	Upsert(ctx context.Context, c content.Content) error
+	DeleteByID(ctx context.Context, id string) error
+}
+
+func NewBot(token string, pollTimeout int, adminSecret string, catalog content.Repository, start start_purchase.Handler, submit submit_review.Handler) (*Bot, error) {
 	api, err := tgbotapi.NewBotAPI(token)
 	if err != nil {
 		return nil, err
@@ -29,7 +38,15 @@ func NewBot(token string, pollTimeout int, catalog content.Repository, start sta
 	if pollTimeout <= 0 {
 		pollTimeout = 30
 	}
-	return &Bot{api: api, catalog: catalog, start: start, submitReview: submit, pollTimeout: pollTimeout}, nil
+	return &Bot{
+		api:          api,
+		catalog:      catalog,
+		start:        start,
+		submitReview: submit,
+		pollTimeout:  pollTimeout,
+		adminSecret:  adminSecret,
+		adminUsers:   map[int64]bool{},
+	}, nil
 }
 
 func (b *Bot) API() *tgbotapi.BotAPI {
@@ -91,6 +108,103 @@ func (b *Bot) handleMessage(ctx context.Context, msg *tgbotapi.Message) {
 			b.reply(chatID, "Welcome. Use /catalog to see available videos.")
 		case "help":
 			b.reply(chatID, "Commands:\n/catalog\n/buy <content_id>\n/review <purchase_id> <rating> [text]")
+		case "adminmode":
+			secret := strings.TrimSpace(msg.CommandArguments())
+			if secret == "" || secret != b.adminSecret {
+				b.reply(chatID, "admin denied")
+				return
+			}
+			enabled := b.toggleAdmin(userID)
+			if enabled {
+				b.reply(chatID, "admin mode enabled")
+			} else {
+				b.reply(chatID, "admin mode disabled")
+			}
+		case "createcontent":
+			if !b.isAdmin(userID) {
+				b.reply(chatID, "admin required")
+				return
+			}
+			// Usage: /createcontent <id> <bunny_video_id> <price> <title>|<description>
+			args := strings.TrimSpace(msg.CommandArguments())
+			parts := strings.Fields(args)
+			if len(parts) < 4 {
+				b.reply(chatID, "Usage: /createcontent <id> <bunny_video_id> <price> <title>|<description>")
+				return
+			}
+			price, err := strconv.Atoi(parts[2])
+			if err != nil || price <= 0 {
+				b.reply(chatID, "price must be positive integer")
+				return
+			}
+			meta := strings.Join(parts[3:], " ")
+			title, desc := splitTitleDesc(meta)
+			if title == "" {
+				title = parts[0]
+			}
+			if err := b.upsertContent(ctx, content.Content{
+				ID:          parts[0],
+				ExternalRef: []byte(parts[1]),
+				Title:       title,
+				Description: desc,
+				PriceStars:  price,
+				Active:      true,
+			}); err != nil {
+				b.reply(chatID, "create content failed")
+				return
+			}
+			b.reply(chatID, "content created")
+		case "deletecontent":
+			if !b.isAdmin(userID) {
+				b.reply(chatID, "admin required")
+				return
+			}
+			contentID := strings.TrimSpace(msg.CommandArguments())
+			if contentID == "" {
+				b.reply(chatID, "Usage: /deletecontent <id>")
+				return
+			}
+			if err := b.deleteContent(ctx, contentID); err != nil {
+				b.reply(chatID, "delete content failed")
+				return
+			}
+			b.reply(chatID, "content deleted")
+		case "setcontent":
+			if !b.isAdmin(userID) {
+				b.reply(chatID, "admin required")
+				return
+			}
+			// Usage: /setcontent <id> <price> <title>|<description>
+			args := strings.TrimSpace(msg.CommandArguments())
+			parts := strings.Fields(args)
+			if len(parts) < 3 {
+				b.reply(chatID, "Usage: /setcontent <id> <price> <title>|<description>")
+				return
+			}
+			price, err := strconv.Atoi(parts[1])
+			if err != nil || price <= 0 {
+				b.reply(chatID, "price must be positive integer")
+				return
+			}
+			existing, err := b.catalog.GetByID(ctx, parts[0])
+			if err != nil || existing == nil {
+				b.reply(chatID, "content not found")
+				return
+			}
+			meta := strings.Join(parts[2:], " ")
+			title, desc := splitTitleDesc(meta)
+			if title != "" {
+				existing.Title = title
+			}
+			if desc != "" {
+				existing.Description = desc
+			}
+			existing.PriceStars = price
+			if err := b.upsertContent(ctx, *existing); err != nil {
+				b.reply(chatID, "update content failed")
+				return
+			}
+			b.reply(chatID, "content updated")
 		case "catalog":
 			items, err := b.catalog.ListActive(ctx)
 			if err != nil {
@@ -108,7 +222,15 @@ func (b *Bot) handleMessage(ctx context.Context, msg *tgbotapi.Message) {
 					tgbotapi.NewInlineKeyboardButtonData(label, "buy:"+c.ID),
 				))
 			}
-			m := tgbotapi.NewMessage(chatID, "Catalog")
+			lines := []string{"Catalog:"}
+			for _, c := range items {
+				line := fmt.Sprintf("- %s (%s): %d⭐", c.Title, c.ID, c.PriceStars)
+				if c.Description != "" {
+					line += "\n  " + c.Description
+				}
+				lines = append(lines, line)
+			}
+			m := tgbotapi.NewMessage(chatID, strings.Join(lines, "\n"))
 			m.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(buttons...)
 			_, _ = b.api.Send(m)
 		case "buy":
@@ -199,4 +321,43 @@ func (b *Bot) ack(callbackID, text string) {
 func (b *Bot) reply(chatID int64, text string) {
 	m := tgbotapi.NewMessage(chatID, text)
 	_, _ = b.api.Send(m)
+}
+
+func (b *Bot) isAdmin(userID int64) bool {
+	b.adminMu.RLock()
+	defer b.adminMu.RUnlock()
+	return b.adminUsers[userID]
+}
+
+func (b *Bot) toggleAdmin(userID int64) bool {
+	b.adminMu.Lock()
+	defer b.adminMu.Unlock()
+	b.adminUsers[userID] = !b.adminUsers[userID]
+	return b.adminUsers[userID]
+}
+
+func (b *Bot) upsertContent(ctx context.Context, c content.Content) error {
+	repo, ok := b.catalog.(contentAdminRepository)
+	if !ok {
+		return fmt.Errorf("catalog repository does not support admin writes")
+	}
+	return repo.Upsert(ctx, c)
+}
+
+func (b *Bot) deleteContent(ctx context.Context, id string) error {
+	repo, ok := b.catalog.(contentAdminRepository)
+	if !ok {
+		return fmt.Errorf("catalog repository does not support admin writes")
+	}
+	return repo.DeleteByID(ctx, id)
+}
+
+func splitTitleDesc(raw string) (string, string) {
+	parts := strings.SplitN(raw, "|", 2)
+	title := strings.TrimSpace(parts[0])
+	desc := ""
+	if len(parts) > 1 {
+		desc = strings.TrimSpace(parts[1])
+	}
+	return title, desc
 }
