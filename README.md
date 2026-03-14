@@ -6,44 +6,107 @@
 
 ## архитектура
 
-система построена по принципу явного разделения слоёв: domain → application → adapters → platform. каждый слой зависит только от слоя ниже, transport-код никогда не содержит бизнес-правил.
+Система построена на **явных bounded contexts** из DDD (Domain-Driven Design). Каждый слой имеет чёткую ответственность и не нарушает границы:
+
+- **platform/** — инфраструктура и утилиты (config, logger, crypto)
+- **domain/** — 5 независимых bounded contexts (user, content, purchase, access, review)
+- **app/** — use cases, оркестрирующие домены
+- **adapters/** — интеграция с внешним миром (telegram, streaming provider, databases)
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│                      telegram client                         │
-└─────────────────────────────┬────────────────────────────────┘
-                              │ https webhook / polling
-┌─────────────────────────────▼────────────────────────────────┐
-│               adapters / telegram (transport)                │
-│  webhook handler, message parser, rate limiter, bot sender   │
-└──────────┬──────────────────┬───────────────────────────────┘
-           │                  │
-           ▼                  ▼
-┌──────────────────────────────────────────────────────────────┐
-│               application layer (use cases)                  │
-│  StartPurchase · ConfirmPayment · IssueAccessLink            │
-│  ExpireAccess  · RequestReview  · SubmitReview               │
-└──────────┬──────────────────┬───────────────────────────────┘
-           │                  │
-           ▼                  ▼
-┌──────────────────────────────────────────────────────────────┐
-│                      domain layer                            │
-│  user · content · purchase · access · review                 │
-│  (сущности, инварианты, переходы состояний)                  │
-└──────────┬──────────────────┬───────────────────────────────┘
-           │                  │
-           ▼                  ▼
-┌────────────────────┐  ┌─────────────────────────────────────┐
-│ adapters/storage   │  │  adapters/streaming                 │
-│ postgres · redis   │  │  http-клиент к внешнему api         │
-└────────────────────┘  └─────────────────────────────────────┘
-           │
-           ▼
-┌──────────────────────────────────────────────────────────────┐
-│                  platform (инфраструктура)                   │
-│  config · logger · crypto · clock · idgen                    │
-└──────────────────────────────────────────────────────────────┘
+              Telegram Webhook (HTTPS)
+                      │
+                      ▼
+          adapters/telegram/webhook.go
+       (verify, parse, duplicate detection)
+                      │
+                      ▼
+    app/confirm_telegram_payment/handler.go
+  (ConfirmPaymentCommand: idempotency, state machine)
+       domain/purchase + event_log + outbox
+                      │
+                      ▼
+      jobs/scheduler.go (outbox processor)
+         PurchaseConfirmed event
+                      │
+                      ▼
+      app/issue_access_link/handler.go
+     (call streaming provider, create token, cache)
+       domain/access + adapters/storage
 ```
+
+**Ключевое правило**: бизнес-логика живёт в **domain/** и **app/**, адаптеры — это просто порты ввода-вывода.
+
+---
+
+## идемпотентность платежей (inbox/outbox pattern)
+
+Входящие платёжные события от Telegram могут приходить дважды (network retries). **Решение**: inbox/outbox.
+
+```sql
+create table idempotency_keys (
+    event_id     text primary key,        -- telegram_charge_id
+    event_type   text not null,
+    processed_at timestamptz not null default now()
+);
+
+create table outbox (
+    id           uuid primary key default gen_random_uuid(),
+    event_type   text not null,           -- 'PurchaseConfirmed'
+    aggregate_id uuid not null,           -- purchase_id
+    payload      jsonb not null,
+    published    boolean not null default false,
+    created_at   timestamptz not null default now()
+);
+```
+
+**Webhook handler**: 1) CHECK is_processed(charge_id) → если да, return 200. 2) Если нет → ConfirmPayment + mark idempotency_key. 3) Publish to outbox (PurchaseConfirmed).
+
+**Результат**: любое кол-во дубликатов webhook'ов = Purchase создан один раз.
+
+---
+
+## redis vs postgres: source of truth
+
+| Данные | PRIMARY | Cache | Потеря = |
+|--------|---------|-------|----------|
+| Все бизнес-данные | **Postgres** | - | ❌ потеря данных |
+| AccessGrant token_hash lookup | Postgres | Redis (TTL) | ✓ fallback SELECT |
+| Session state | - | Redis | ✓ user вводит заново |
+
+**Redis = performance layer, не source of truth**. На потере redis → fallback в postgres (медленно, но работает).
+
+---
+
+## асинхронность (outbox publisher + scheduler)
+
+Outbox publisher читает `outbox` таблицу (stored-in-DB guarantee) и публикует события.
+
+```go
+func (s *Scheduler) processOutbox(ctx context.Context) {
+    events := s.outboxRepo.GetUnpublished(ctx)
+    for _, evt := range events {
+        s.issueAccessLinkHandler.Handle(ctx, evt.AggregateID)
+        s.outboxRepo.MarkPublished(ctx, evt.ID)
+    }
+}
+
+func (s *Scheduler) Start(ctx context.Context) {
+    ticker := time.NewTicker(30 * time.Second)
+    for {
+        select {
+        case <-ticker.C:
+            s.processOutbox(ctx)
+            s.expireAccessGrants(ctx)
+            s.requestPendingReviews(ctx)
+        case <-ctx.Done():
+            return
+        }
+    }
+}
+```
+
+**IssueAccessLink** выполняется асинхронно, но гарантированно (stored in outbox table).
 
 ---
 
@@ -72,77 +135,144 @@
 streamingbot/
 ├── cmd/
 │   └── bot/
-│       └── main.go                      # точка входа, wire зависимостей
+│       └── main.go                      # точка входа, DI, wire зависимостей
 │
 ├── internal/
 │   │
-│   ├── domain/                          # бизнес-правила, без зависимостей на фреймворки
-│   │   ├── user/
-│   │   │   ├── user.go                  # сущность user, инварианты
-│   │   │   └── repository.go           # интерфейс репозитория
-│   │   ├── content/
-│   │   │   ├── content.go               # сущность content (id, title, price_stars)
-│   │   │   └── repository.go
-│   │   ├── purchase/
-│   │   │   ├── purchase.go              # сущность purchase, fsm состояний
-│   │   │   ├── states.go                # pending → paid → access_issued → expired | refunded
-│   │   │   └── repository.go
-│   │   ├── access/
-│   │   │   ├── access_grant.go          # сущность access_grant (token, ttl, used_at)
-│   │   │   └── repository.go
-│   │   └── review/
-│   │       ├── review.go                # сущность review (rating, text, published)
-│   │       └── repository.go
+│   ├── domain/                          # бизнес-правила, НОЛЬ зависимостей на фреймворки
+│   │   ├── user/                        # User bounded context (только базовые данные)
+│   │   │   ├── user.go                  # User aggregate root
+│   │   │   ├── repository.go            # interface UserRepository
+│   │   │   └── errors.go
+│   │   ├── content/                     # Content bounded context (каталог, метаданные)
+│   │   │   ├── content.go               # Content aggregate root
+│   │   │   ├── repository.go
+│   │   │   └── errors.go
+│   │   ├── purchase/                    # ЦЕНТРАЛЬНЫЙ bounded context: жизненный цикл покупки
+│   │   │   ├── purchase.go              # Purchase aggregate root с FSM (pending→paid→issued→expired)
+│   │   │   ├── status.go                # enum Status
+│   │   │   ├── factory.go               # создание новых Purchase
+│   │   │   ├── repository.go
+│   │   │   └── errors.go
+│   │   ├── access/                      # ДОМЕН ДОСТУПА: одноразовые ссылки/токены
+│   │   │   ├── grant.go                 # AccessGrant aggregate root
+│   │   │   ├── repository.go
+│   │   │   └── errors.go
+│   │   └── review/                      # Review bounded context (НЕ часть User!)
+│   │       ├── review.go                # Review aggregate
+│   │       ├── repository.go
+│   │       └── errors.go
 │   │
-│   ├── app/                             # use cases: координируют домен и адаптеры
-│   │   ├── start_purchase.go            # создать purchase, инициировать invoice
-│   │   ├── confirm_payment.go           # идемпотентная обработка successful_payment
-│   │   ├── issue_access_link.go         # выпустить access_grant, отправить ссылку
-│   │   ├── expire_access.go             # фоновая инвалидация просроченных grant-ов
-│   │   ├── request_review.go            # scheduler: запросить отзыв через n часов
-│   │   └── submit_review.go             # сохранить отзыв, опубликовать при необходимости
+│   ├── app/                             # ORCHESTRATION LAYER: use cases, никакой бизнес-логики
+│   │   ├── start_purchase/
+│   │   │   ├── command.go
+│   │   │   └── handler.go
+│   │   ├── confirm_telegram_payment/    # ГЛАВНЫЙ ENTRY POINT для плата
+│   │   │   ├── command.go
+│   │   │   └── handler.go               # идемпотентная обработка + inbox/outbox
+│   │   ├── issue_access_link/
+│   │   │   ├── command.go
+│   │   │   └── handler.go               # интеграция с StreamingProvider
+│   │   ├── request_review/
+│   │   │   ├── command.go
+│   │   │   └── handler.go
+│   │   ├── expire_access/
+│   │   │   ├── command.go
+│   │   │   └── handler.go
+│   │   └── submit_review/
+│   │       ├── command.go
+│   │       └── handler.go
 │   │
-│   ├── adapters/
-│   │   ├── telegram/
-│   │   │   ├── webhook.go               # приём и верификация webhook от telegram
-│   │   │   ├── handler.go               # маршрутизация команд и callback
-│   │   │   ├── sender.go                # отправка сообщений пользователю
-│   │   │   └── middleware.go            # rate limiting, валидация, логирование запросов
-│   │   ├── streaming/
-│   │   │   ├── provider.go              # интерфейс StreamingProvider
-│   │   │   └── client.go                # http-клиент к внешнему streaming api
-│   │   └── storage/
-│   │       ├── postgres/
+│   ├── adapters/                        # ИНТЕГРАЦИЯ С ВНЕШНИМ МИРОМ (входная/выходная)
+│   │   ├── telegram/                    # Telegram webhook adapter
+│   │   │   ├── webhook.go               # приём и верификация webhook
+│   │   │   ├── handler.go               # маршрутизация к use case handlers
+│   │   │   ├── sender.go                # отправка сообщений
+│   │   │   └── middleware.go            # rate limit, auth, logging
+│   │   ├── streaming/                   # Streaming provider adapter
+│   │   │   ├── provider.go              # interface StreamingProvider (АДАПТЕР!)
+│   │   │   ├── client.go                # реализация: http клиент к external API
+│   │   │   └── errors.go
+│   │   └── storage/                     # Persistence adapters
+│   │       ├── postgres/                # Postgres repository implementations
 │   │       │   ├── user_repo.go
 │   │       │   ├── content_repo.go
 │   │       │   ├── purchase_repo.go
 │   │       │   ├── access_repo.go
 │   │       │   ├── review_repo.go
-│   │       │   └── event_log_repo.go    # audit trail платёжных событий
-│   │       └── redis/
-│   │           ├── session_store.go     # короткоживущие сессии бота
-│   │           └── token_store.go       # одноразовые access токены (ttl, инвалидация)
+│   │       │   ├── event_log_repo.go    # audit trail платёжных событий
+│   │       │   └── idempotency_key_repo.go # inbox pattern
+│   │       └── redis/                   # Redis: PERFORMANCE LAYER (кэш, НЕ source of truth!)
+│   │           ├── token_store.go       # AccessGrant.token_hash lookup + TTL
+│   │           └── session_store.go     # краткоживущие сессии бота
 │   │
-│   └── platform/
-│       ├── config/
-│       │   └── config.go                # загрузка конфигурации из env
-│       ├── logger/
-│       │   └── logger.go                # структурированное логирование без чувствительных данных
-│       ├── crypto/
-│       │   ├── token.go                 # генерация hmac-подписанных токенов
-│       │   └── encrypt.go              # aes-256-gcm шифрование полей
-│       ├── clock/
-│       │   └── clock.go                 # абстракция времени (тестируемость)
-│       └── idgen/
-│           └── idgen.go                 # генерация uuid v7 / ulid
+│   ├── platform/                        # ИНФРАСТРУКТУРА (internal/platform, не pkg/!)
+│   │   ├── config/
+│   │   │   └── config.go                # загрузка из env
+│   │   ├── logger/
+│   │   │   └── logger.go                # структурированное логирование (redaction)
+│   │   ├── crypto/
+│   │   │   ├── token.go                 # Token: generate + validate (HMAC-SHA256)
+│   │   │   └── encrypt.go              # AES-256-GCM шифрование external_ref
+│   │   ├── clock/
+│   │   │   └── clock.go                 # абстракция времени
+│   │   └── idgen/
+│   │       └── idgen.go                 # UUID/ULID generation
+│   │
+│   └── jobs/                            # АСИНХРОННЫЕ ЗАДАЧИ
+│       ├── scheduler.go                 # главный scheduler (outbox processor + cleanup)
+│       └── commands.go                  # внутренние команды для фоновых работ
 │
-├── migrations/                          # sql-миграции (golang-migrate)
-├── scheduler/
-│   └── scheduler.go                     # планировщик фоновых задач (cron / worker)
+├── migrations/                          # SQL migrations (golang-migrate)
 ├── .env.example
 ├── docker-compose.yml
 └── Dockerfile
 ```
+
+**Замечание по структуре**: 
+- `internal/platform/` а не `pkg/` — потому что это инфраструктура **этого приложения**, не переиспользуемая библиотека
+- Каждый `domain/*`완독 независим и имеет свой repository интерфейс
+- `adapters/` содержит реализации, бизнес-логика живёт в domain + app
+
+---
+
+## bounded contexts (явные домены ответственности)
+
+### domain/user — только пользовательские данные
+Отвечает за: регистрацию, базовые данные, бан-статус.
+НЕ отвечает за: историю покупок, отзывы, сессии.
+
+### domain/content — каталог и метаданные
+Отвечает за: контент, цены, активность. `external_ref` ВСЕГДА зашифрован.
+
+### domain/purchase — ЦЕНТРАЛЬНАЯ сущность заказа
+Отвечает за: жизненный цикл: pending → paid → access_issued → expired | error.
+Инварианты:
+- `telegram_charge_id` уникален (защита от двойной оплаты)
+- Переход `paid → access_issued` только если AccessGrant создан
+- На критических ошибках: переход → error (требует retry)
+
+### domain/access — одноразовый доступ
+Отвечает за: жизненный цикл токена.
+Инварианты:
+- `token_hash` уникален; сам token НИКОГДА не храним
+- Одноразовость: первое использование → `used_at = now()`, дальше error
+- Валидность определяется `expires_at`, а НЕ redis TTL
+
+### domain/review — отзывы НЕ принадлежат User
+Отвечает за: отзывы к покупкам.
+Инвариант: связан с Purchase, не User.
+
+---
+
+## application layer (use cases / orchestration)
+
+Оркестрирует домены, вызывает адаптеры, управляет транзакциями. **Никогда не содержит бизнес-логику**.
+
+- **ConfirmTelegramPayment**: webhook → Purchase.MarkAsPaid() → audit log → outbox event
+- **IssueAccessLink**: outbox event → StreamingProvider → AccessGrant → postgres + redis cache
+- **RequestReview**: scheduler → найти Purchase → отправить telegram
+- Остальные: по аналогии
 
 ---
 
@@ -336,7 +466,7 @@ pending ──► paid ──► access_issued ──► expired
 
 ---
 
-## безопасность
+## безопасность (architecture, не checklist)
 
 ### управление ключами и секретами
 - все секреты передаются только через переменные окружения, в коде нет хардкода
