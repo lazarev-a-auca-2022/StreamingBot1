@@ -282,7 +282,85 @@ docker compose ps
 
 ---
 
-## 12. Quick Start Summary
+## 12. User Guide
+
+This section explains how to use the system today.
+
+### 12.1 Current user flow
+
+The project now supports Telegram command interaction and API endpoints.
+
+Flow:
+1. User opens bot and runs `/start`.
+2. User runs `/catalog` or taps buy button.
+3. User starts purchase (`/buy <content_id>` or callback button).
+4. Payment provider calls successful payment webhook.
+5. Scheduler processes outbox and issues access link.
+6. User receives link in Telegram message and opens it.
+7. User submits review with `/review <purchase_id> <rating> [text]`.
+
+### 12.1.1 Telegram command menu
+
+Bot menu commands configured via Telegram `setMyCommands`:
+- `/start`
+- `/catalog`
+- `/buy`
+- `/review`
+- `/help`
+
+### 12.2 Endpoints used in the flow
+
+Health check:
+
+curl http://localhost:8080/healthz
+
+Get catalog:
+
+curl http://localhost:8080/catalog
+
+Start purchase:
+
+curl -X POST http://localhost:8080/purchase/start \
+  -H "Content-Type: application/json" \
+  -d '{"user_id":12345,"content_id":"content-demo-1"}'
+
+Example response contains purchase_id and invoice_payload.
+
+Confirm successful payment (normally called by payment provider webhook):
+
+curl -X POST http://localhost:8080/webhook/telegram/successful_payment \
+  -H "Content-Type: application/json" \
+  -H "X-Telegram-Bot-Api-Secret-Token: <WEBHOOK_SECRET>" \
+  -d '{"charge_id":"charge-001","amount_stars":25,"invoice_payload":"<payload-from-start-purchase>","raw_payload":"{}"}'
+
+Use issued access token:
+
+curl -X POST http://localhost:8080/access/use \
+  -H "Content-Type: application/json" \
+  -d '{"token":"<token-from-access-link>"}'
+
+Submit review:
+
+curl -X POST http://localhost:8080/review/submit \
+  -H "Content-Type: application/json" \
+  -d '{"user_id":12345,"purchase_id":"<purchase_id>","rating":5,"text":"Great stream"}'
+
+### 12.3 Bunny-specific requirement
+
+For catalog items to be playable, each content item must have external_ref set to a valid Bunny videoId in the database.
+
+### 12.4 Where this flow is implemented
+
+- API handlers: [internal/adapters/httpapi/server.go](internal/adapters/httpapi/server.go)
+- Purchase start: [internal/app/start_purchase/handler.go](internal/app/start_purchase/handler.go)
+- Payment confirmation: [internal/app/confirm_payment/handler.go](internal/app/confirm_payment/handler.go)
+- Access issuance: [internal/app/issue_access/handler.go](internal/app/issue_access/handler.go)
+- Access consumption: [internal/app/use_access/handler.go](internal/app/use_access/handler.go)
+- Review submission: [internal/app/submit_review/handler.go](internal/app/submit_review/handler.go)
+
+---
+
+## 13. Quick Start Summary
 
 ### Local:
 

@@ -10,6 +10,8 @@ import (
 type Config struct {
 	BotToken             string
 	WebhookSecret        string
+	TelegramPolling      bool
+	TelegramPollTimeout  int
 	HTTPAddr             string
 	DatabaseURL          string
 	RedisURL             string
@@ -29,6 +31,8 @@ func Load() (Config, error) {
 	cfg := Config{
 		BotToken:             os.Getenv("BOT_TOKEN"),
 		WebhookSecret:        os.Getenv("WEBHOOK_SECRET"),
+		TelegramPolling:      getenvBool("TELEGRAM_POLLING", true),
+		TelegramPollTimeout:  getenvInt("TELEGRAM_POLL_TIMEOUT_SEC", 30),
 		HTTPAddr:             getenvDefault("HTTP_ADDR", ":8080"),
 		DatabaseURL:          getenvDefault("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/streamingbot?sslmode=disable"),
 		RedisURL:             getenvDefault("REDIS_URL", "redis://localhost:6379/0"),
@@ -80,4 +84,19 @@ func getenvInt(key string, fallback int) int {
 		return fallback
 	}
 	return n
+}
+
+func getenvBool(key string, fallback bool) bool {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback
+	}
+	switch v {
+	case "1", "true", "TRUE", "yes", "on":
+		return true
+	case "0", "false", "FALSE", "no", "off":
+		return false
+	default:
+		return fallback
+	}
 }

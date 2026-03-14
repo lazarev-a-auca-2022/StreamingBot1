@@ -78,7 +78,7 @@ func main() {
 		Grants:     accessRepo,
 		Provider:   streaming.NewBunnyClient(cfg.BunnyLibraryID, cfg.BunnyAPIKey, cfg.BunnyAPIBaseURL, cfg.BunnyEmbedBaseURL, cfg.BunnyTokenAuthKey),
 		Tokens:     crypto.NewTokenService(),
-		Sender:     telegram.NewSender(),
+		Sender:     telegram.NewSender(nil),
 		Cache:      tokenCache,
 		TTL:        time.Duration(cfg.AccessLinkTTLMinutes) * time.Minute,
 		MaxRetries: 3,
@@ -107,6 +107,23 @@ func main() {
 	}
 	scheduler := jobs.NewScheduler(2 * time.Second)
 	go scheduler.Start(ctx, processor.RunOnce)
+
+	if cfg.TelegramPolling {
+		tgBot, err := telegram.NewBot(cfg.BotToken, cfg.TelegramPollTimeout, contentRepo, startPurchaseUC, submitReviewUC)
+		if err != nil {
+			if cfg.Environment == "production" || cfg.Environment == "prod" {
+				log.Fatalf("telegram bot init: %v", err)
+			}
+			log.Printf("telegram bot disabled (init error): %v", err)
+		} else {
+			issueAccessUC.Sender = telegram.NewSender(tgBot.API())
+			go func() {
+				if err := tgBot.Start(ctx); err != nil {
+					log.Printf("telegram bot stopped: %v", err)
+				}
+			}()
+		}
+	}
 
 	go func() {
 		if err := httpapi.StartServer(ctx, cfg.HTTPAddr, api.Handler()); err != nil && !errors.Is(err, http.ErrServerClosed) {
