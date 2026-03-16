@@ -377,6 +377,8 @@ func (b *Bot) startPurchase(ctx context.Context, chatID int64, userID int64, con
 		"XTR",
 		prices,
 	)
+	// go-telegram-bot-api serializes nil []int as JSON null, but Telegram expects an array.
+	invoice.SuggestedTipAmounts = []int{}
 
 	if _, err := b.api.Send(invoice); err != nil {
 		log.Printf("telegram_send_invoice_failed chat_id=%d user_id=%d content_id=%s purchase_id=%s err=%v", chatID, userID, contentID, res.PurchaseID, err)
