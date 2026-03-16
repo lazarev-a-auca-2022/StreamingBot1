@@ -3,6 +3,7 @@ package telegram
 import (
 	"context"
 	"fmt"
+	"log"
 	"strconv"
 	"strings"
 	"sync"
@@ -378,6 +379,7 @@ func (b *Bot) startPurchase(ctx context.Context, chatID int64, userID int64, con
 	)
 
 	if _, err := b.api.Send(invoice); err != nil {
+		log.Printf("telegram_send_invoice_failed chat_id=%d user_id=%d content_id=%s purchase_id=%s err=%v", chatID, userID, contentID, res.PurchaseID, err)
 		b.reply(chatID, fmt.Sprintf("Purchase created, but invoice send failed. Purchase ID: %s", res.PurchaseID))
 		return
 	}
@@ -466,7 +468,9 @@ func (b *Bot) handlePreCheckout(ctx context.Context, q *tgbotapi.PreCheckoutQuer
 
 	resp.OK = true
 	resp.ErrorMessage = ""
-	_, _ = b.api.Request(resp)
+	if _, err := b.api.Request(resp); err != nil {
+		log.Printf("telegram_precheckout_answer_failed query_id=%s err=%v", q.ID, err)
+	}
 }
 
 func (b *Bot) forceBuy(ctx context.Context, chatID int64, userID int64, contentID string) error {
