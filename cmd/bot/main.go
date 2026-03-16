@@ -117,7 +117,7 @@ func main() {
 		Tokens:     crypto.NewTokenService(),
 		Sender:     telegramSender,
 		Cache:      tokenCache,
-		TTL:        time.Duration(cfg.AccessLinkTTLMinutes) * time.Minute,
+		TTL:        24 * time.Hour,
 		MaxRetries: 3,
 	}
 	useAccessUC := use_access.Handler{Grants: accessRepo, Cache: tokenCache}
